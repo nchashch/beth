@@ -1,0 +1,21 @@
+[package]
+name = "beth"
+version = "0.1.0"
+rust-version = "1.95"
+edition = "2024"
+
+[dependencies]
+miette = "7.6.0"
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
+
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+eyre = "0.6.14"
