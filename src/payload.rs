@@ -16,6 +16,12 @@
 //! that a block's withdrawals match the real deposits for the mainchain range it claims — a
 //! malicious block producer could currently fabricate withdrawals. That verification is the
 //! natural next piece of work here.
+//!
+//! This builder also reads [`crate::withdrawal_bundle`]'s queue on every block and selects a
+//! BIP300 withdrawal bundle (a *real* BIP300 withdrawal, sidechain -> mainchain — see that
+//! module's doc comment) if one fits, logging it. It does not yet broadcast the bundle to the
+//! enforcer or write anything back to `WithdrawalRequestQueue` — see that module's doc comment
+//! for what's missing before this is more than a read-only preview.
 
 use std::sync::Arc;
 
@@ -44,7 +50,7 @@ use reth_transaction_pool::{
     ValidPoolTransaction,
 };
 
-use crate::enforcer::EnforcerClient;
+use crate::{enforcer::EnforcerClient, withdrawal_bundle};
 
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
@@ -95,10 +101,18 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
     ///
     /// A `parent_extra_data` that isn't a valid 32-byte mainchain hash (e.g. building directly
     /// on genesis, which carries no BIP301 provenance) is treated as "start of history".
+    ///
+    /// Also previews a BIP300 withdrawal bundle (see [`crate::withdrawal_bundle`]) built from
+    /// `parent_hash`/`parent_number`'s state — logged, not yet acted on.
     fn next_block_context(
         &self,
         parent_extra_data: &Bytes,
-    ) -> Result<(EthereumBuilderConfig, Vec<Withdrawal>), PayloadBuilderError> {
+        parent_hash: B256,
+        parent_number: u64,
+    ) -> Result<(EthereumBuilderConfig, Vec<Withdrawal>), PayloadBuilderError>
+    where
+        Client: StateProviderFactory,
+    {
         let main_tip = self
             .enforcer
             .chain_tip()
@@ -127,6 +141,34 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
             .clone()
             .with_extra_data(Bytes::copy_from_slice(main_tip.as_slice()));
 
+        // Preview a BIP300 withdrawal bundle (sidechain -> mainchain), if one fits. Not yet
+        // broadcast to the enforcer, and not yet accounted for in the block itself — see
+        // `crate::withdrawal_bundle`'s module doc comment for what's missing. A failure here is
+        // deliberately non-fatal: nothing in the block depends on this yet.
+        let next_block_number = u32::try_from(parent_number.saturating_add(1)).unwrap_or(u32::MAX);
+        match self.client.state_by_block_hash(parent_hash) {
+            Ok(state) => match withdrawal_bundle::read_pending_withdrawals(state.as_ref()) {
+                Ok(pending) => {
+                    if let Some(bundle) =
+                        withdrawal_bundle::select_withdrawal_bundle(&pending, next_block_number)
+                    {
+                        tracing::debug!(
+                            m6id = %bundle.m6id(),
+                            requests = ?bundle.request_indices,
+                            outputs = bundle.tx.output.len(),
+                            "previewed BIP300 withdrawal bundle (not broadcast)",
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "failed to read WithdrawalRequestQueue");
+                }
+            },
+            Err(err) => {
+                tracing::warn!(%err, "failed to load parent state for withdrawal bundle preview");
+            }
+        }
+
         Ok((builder_config, withdrawals))
     }
 }
@@ -144,8 +186,11 @@ where
         &self,
         mut args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
-        let (builder_config, withdrawals) =
-            self.next_block_context(args.config.parent_header.header().extra_data())?;
+        let (builder_config, withdrawals) = self.next_block_context(
+            args.config.parent_header.header().extra_data(),
+            args.config.parent_header.hash(),
+            args.config.parent_header.header().number(),
+        )?;
         // `attributes.withdrawals` is the EIP-4895 field — here it carries BIP300 deposits, not
         // BIP300 withdrawals (see module doc comment).
         args.config.attributes.withdrawals = Some(withdrawals);
@@ -177,8 +222,11 @@ where
         &self,
         mut config: PayloadConfig<Self::Attributes>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
-        let (builder_config, withdrawals) =
-            self.next_block_context(config.parent_header.header().extra_data())?;
+        let (builder_config, withdrawals) = self.next_block_context(
+            config.parent_header.header().extra_data(),
+            config.parent_header.hash(),
+            config.parent_header.header().number(),
+        )?;
         // `attributes.withdrawals` is the EIP-4895 field — here it carries BIP300 deposits, not
         // BIP300 withdrawals (see module doc comment).
         config.attributes.withdrawals = Some(withdrawals);

@@ -17,7 +17,13 @@
       {
         "indexed": false,
         "internalType": "uint256",
-        "name": "amountWei",
+        "name": "valueSats",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "mainFeeSats",
         "type": "uint256"
       },
       {
@@ -49,6 +55,11 @@
         "internalType": "bytes",
         "name": "btcDestination",
         "type": "bytes"
+      },
+      {
+        "internalType": "uint256",
+        "name": "mainFeeSats",
+        "type": "uint256"
       }
     ],
     "name": "requestWithdrawal",
@@ -79,7 +90,12 @@
       },
       {
         "internalType": "uint256",
-        "name": "amountWei",
+        "name": "valueSats",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "mainFeeSats",
         "type": "uint256"
       },
       {

@@ -3,6 +3,7 @@ mod consensus;
 mod enforcer;
 mod payload;
 mod proto;
+mod withdrawal_bundle;
 
 use chainspec::BethChainSpecParser;
 use clap::Parser;
