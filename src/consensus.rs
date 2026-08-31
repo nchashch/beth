@@ -5,18 +5,18 @@ use std::{fmt::Debug, sync::Arc};
 
 use alloy_primitives::B256;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_consensus::{
-    Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom,
-};
+use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_execution_types::BlockExecutionResult;
 use reth_node_builder::{
+    BuilderContext,
     components::ConsensusBuilder,
     node::{FullNodeTypes, NodeTypes},
-    BuilderContext,
 };
-use reth_primitives_traits::{Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
+use reth_primitives_traits::{
+    Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
+};
 
 use crate::enforcer::EnforcerClient;
 
@@ -32,7 +32,11 @@ pub struct Bip301Consensus<ChainSpec> {
 
 impl<ChainSpec: EthChainSpec + EthereumHardforks> Bip301Consensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>, enforcer: EnforcerClient, sidechain_id: u32) -> Self {
-        Self { inner: EthBeaconConsensus::new(chain_spec), enforcer, sidechain_id }
+        Self {
+            inner: EthBeaconConsensus::new(chain_spec),
+            enforcer,
+            sidechain_id,
+        }
     }
 }
 
@@ -133,7 +137,10 @@ pub struct Bip301ConsensusBuilder {
 
 impl Bip301ConsensusBuilder {
     pub fn new(enforcer: EnforcerClient, sidechain_id: u32) -> Self {
-        Self { enforcer, sidechain_id }
+        Self {
+            enforcer,
+            sidechain_id,
+        }
     }
 }
 
@@ -146,6 +153,10 @@ where
     type Consensus = Arc<Bip301Consensus<<Node::Types as NodeTypes>::ChainSpec>>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        Ok(Arc::new(Bip301Consensus::new(ctx.chain_spec(), self.enforcer, self.sidechain_id)))
+        Ok(Arc::new(Bip301Consensus::new(
+            ctx.chain_spec(),
+            self.enforcer,
+            self.sidechain_id,
+        )))
     }
 }

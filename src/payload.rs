@@ -9,18 +9,18 @@
 use std::sync::Arc;
 
 use alloy_primitives::Bytes;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
-use reth_ethereum_payload_builder::{default_ethereum_payload, EthereumBuilderConfig};
+use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_node_builder::{
-    components::PayloadBuilderBuilder, BuilderContext, FullNodeTypes, NodeTypes,
-    PayloadBuilderConfig, PayloadTypes, PrimitivesTy, TxTy,
+    BuilderContext, FullNodeTypes, NodeTypes, PayloadBuilderConfig, PayloadTypes, PrimitivesTy,
+    TxTy, components::PayloadBuilderBuilder,
 };
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_storage_api::StateProviderFactory;
@@ -54,14 +54,26 @@ impl<Pool, Client, EvmConfig> Bip301PayloadBuilder<Pool, Client, EvmConfig> {
         builder_config: EthereumBuilderConfig,
         enforcer: EnforcerClient,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, enforcer }
+        Self {
+            client,
+            pool,
+            evm_config,
+            builder_config,
+            enforcer,
+        }
     }
 
     /// The static builder config, with `extraData` overridden to the current BIP301 mainchain
     /// tip as reported by the enforcer.
     fn builder_config_for_next_block(&self) -> Result<EthereumBuilderConfig, PayloadBuilderError> {
-        let main_tip = self.enforcer.chain_tip().map_err(PayloadBuilderError::other)?;
-        Ok(self.builder_config.clone().with_extra_data(Bytes::copy_from_slice(main_tip.as_slice())))
+        let main_tip = self
+            .enforcer
+            .chain_tip()
+            .map_err(PayloadBuilderError::other)?;
+        Ok(self
+            .builder_config
+            .clone()
+            .with_extra_data(Bytes::copy_from_slice(main_tip.as_slice())))
     }
 }
 

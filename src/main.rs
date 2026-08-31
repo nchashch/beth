@@ -30,9 +30,9 @@ fn main() -> eyre::Result<()> {
             .with_components(
                 EthereumNode::components()
                     .consensus(Bip301ConsensusBuilder::new(enforcer.clone(), sidechain_id))
-                    .payload(BasicPayloadServiceBuilder::new(Bip301PayloadBuilderBuilder::new(
-                        enforcer,
-                    ))),
+                    .payload(BasicPayloadServiceBuilder::new(
+                        Bip301PayloadBuilderBuilder::new(enforcer),
+                    )),
             )
             .with_add_ons(EthereumAddOns::default())
             .launch()
