@@ -73,6 +73,8 @@ pub struct Bip300301PayloadBuilder<Pool, Client, EvmConfig = EthEvmConfig> {
     builder_config: EthereumBuilderConfig,
     enforcer: EnforcerClient,
     sidechain_id: u32,
+    // FIXME: This must be a part of the consensus state.
+    //
     /// Shared (not per-clone) so every handle to this payload builder sees the same in-flight
     /// bundle tracking. See `crate::withdrawal_bundle`'s module doc comment for its
     /// restart-safety caveat.
