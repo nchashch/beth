@@ -39,12 +39,12 @@ const GWEI_PER_SAT: u64 = 10;
 ///   extraData]` from the enforcer — the same range, and same conversion, [`crate::payload`]
 ///   uses to mint them.
 ///
-/// Only that deposit *prefix* is verified. `beth`'s payload builder can also append
-/// withdrawal-bundle-refund credits after the deposits (see [`crate::withdrawal_bundle`]) —
-/// those aren't independently verifiable yet, since no durable, cross-node bundle-status
-/// tracking exists (see that module's doc comment), so a block producer could still forge
-/// refunds today. Extending this check to cover them is the natural next step once that
-/// tracking exists.
+/// Only that deposit *prefix* is verified. BIP300 withdrawal-bundle lifecycle updates (bundling,
+/// and refunding failed requests) are handled separately, via [`crate::evm`]'s system call
+/// against `WithdrawalRequestQueue`'s own contract storage — not via EIP-4895 withdrawals, so
+/// there's nothing here for this consensus check to cover. That system call is itself part of
+/// normal block execution, so a forged update is already caught by standard state-root
+/// validation; see [`crate::withdrawal_bundle`]'s module doc comment for the full picture.
 #[derive(Debug, Clone)]
 pub struct Bip300301Consensus<ChainSpec, Provider> {
     inner: EthBeaconConsensus<ChainSpec>,
