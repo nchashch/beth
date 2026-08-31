@@ -13,18 +13,29 @@
 //! [`requests_commitment`]). `btcDestination` here is a raw scriptPubKey rather than a parsed
 //! `bitcoin::Address`, avoiding an address-format/network round-trip.
 //!
-//! Not yet wired up: broadcasting the constructed bundle to the enforcer
-//! (`WalletService.BroadcastWithdrawalBundle`), and — more importantly — writing bundle
-//! outcomes back to `WithdrawalRequestQueue`. The contract has no "bundled" status, so
-//! [`read_pending_withdrawals`] always returns every request ever queued; calling
-//! [`select_withdrawal_bundle`] on consecutive blocks will keep reselecting the same requests
-//! until that write-back path exists.
+//! [`InFlightBundles`] tracks broadcast-but-unresolved bundles and permanently-finalized
+//! request indices (paid out, or refunded after a failed bundle), so [`Bip300301PayloadBuilder`]
+//! doesn't keep re-selecting requests that are already spoken for. This is **not** a
+//! `WithdrawalRequestQueue` write-back — the contract still has no "bundled" status field, so
+//! [`read_pending_withdrawals`] always returns every request ever queued, unfiltered.
+//! [`InFlightBundles`] lives only in this process's memory: it does not survive a restart, is
+//! not shared across multiple block-producing nodes, and is not verified by
+//! `Bip300301Consensus` at all. A restart forgets every in-flight/finalized index, so every
+//! previously-succeeded-or-refunded request becomes selectable again — risking a duplicate
+//! Bitcoin payout (for a previously-succeeded bundle) or a duplicate refund (for a
+//! previously-failed one). Fixing this properly needs the bundle/request status to live
+//! on-chain in `WithdrawalRequestQueue`, written back by a trusted (signed or system-call)
+//! transaction — out of scope here; this in-memory version is the pragmatic middle step.
+//!
+//! [`Bip300301PayloadBuilder`]: crate::payload::Bip300301PayloadBuilder
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use bitcoin::script::PushBytesBuf;
 use reth_storage_api::{StateProvider, errors::provider::ProviderResult};
+
+use crate::enforcer::{WithdrawalBundleOutcome, WithdrawalBundleStatus};
 
 /// The `WithdrawalRequestQueue` predeploy address (see `genesis.json`).
 pub const WITHDRAWAL_REQUEST_QUEUE_ADDRESS: Address =
@@ -40,9 +51,6 @@ const REQUESTS_MAPPING_SLOT: u64 = 1;
 #[derive(Debug, Clone)]
 pub struct PendingWithdrawal {
     pub index: u64,
-    // Not yet read anywhere: needed once bundle-failure refunds are written back to
-    // `WithdrawalRequestQueue`, which requires knowing who to refund.
-    #[allow(dead_code)]
     pub requester: Address,
     pub value_sats: u64,
     pub main_fee_sats: u64,
@@ -421,6 +429,62 @@ const fn predict_weight(n_outputs: u32, sum_txout_sizes: u32) -> Option<bitcoin:
     }
 }
 
+/// Tracks BIP300 withdrawal bundles broadcast but not yet resolved, and every request index
+/// that must never be selected again. See the module doc comment for the (significant)
+/// restart-safety caveat.
+#[derive(Debug, Default)]
+pub struct InFlightBundles {
+    /// m6id -> the request indices it consumed, for bundles broadcast but not yet resolved.
+    pending: HashMap<bitcoin::Txid, Vec<u64>>,
+    /// Every request index that must never be selected again: already paid out on Bitcoin, or
+    /// already refunded after its bundle failed.
+    finalized: HashSet<u64>,
+}
+
+impl InFlightBundles {
+    /// Whether `index` may be selected into a new bundle: not already finalized, and not
+    /// consumed by a bundle that's still awaiting an outcome.
+    pub fn is_eligible(&self, index: u64) -> bool {
+        !self.finalized.contains(&index)
+            && !self
+                .pending
+                .values()
+                .any(|indices| indices.contains(&index))
+    }
+
+    /// Records a newly broadcast bundle's consumed request indices.
+    pub fn record_submitted(&mut self, m6id: bitcoin::Txid, indices: Vec<u64>) {
+        self.pending.insert(m6id, indices);
+    }
+
+    /// Resolves `outcomes` against currently-tracked bundles: on `Succeeded`, the bundle's
+    /// requests are finalized (paid out, excluded forever). On `Failed`, they're also
+    /// finalized, and returned here so the caller can refund them — the caller must actually
+    /// credit those refunds, since this method only updates in-memory tracking. `Submitted` and
+    /// outcomes for untracked m6ids (e.g. another producer's bundle, or ours from before a
+    /// restart) are ignored.
+    pub fn resolve(&mut self, outcomes: &[WithdrawalBundleOutcome]) -> Vec<u64> {
+        let mut to_refund = Vec::new();
+        for outcome in outcomes {
+            match outcome.status {
+                WithdrawalBundleStatus::Succeeded => {
+                    if let Some(indices) = self.pending.remove(&outcome.m6id) {
+                        self.finalized.extend(indices);
+                    }
+                }
+                WithdrawalBundleStatus::Failed => {
+                    if let Some(indices) = self.pending.remove(&outcome.m6id) {
+                        self.finalized.extend(indices.iter().copied());
+                        to_refund.extend(indices);
+                    }
+                }
+                WithdrawalBundleStatus::Submitted => {}
+            }
+        }
+        to_refund
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +649,90 @@ mod tests {
         assert!(predict_weight(1, 43).is_some());
         // A huge number of outputs must eventually exceed MAX_STANDARD_WEIGHT.
         assert!(predict_weight(u32::MAX / 100, u32::MAX / 2).is_none());
+    }
+
+    fn txid(byte: u8) -> bitcoin::Txid {
+        use bitcoin::hashes::Hash as _;
+        bitcoin::Txid::from_byte_array([byte; 32])
+    }
+
+    #[test]
+    fn in_flight_bundles_starts_with_everything_eligible() {
+        let in_flight = InFlightBundles::default();
+        assert!(in_flight.is_eligible(0));
+        assert!(in_flight.is_eligible(42));
+    }
+
+    #[test]
+    fn in_flight_bundles_excludes_submitted_indices() {
+        let mut in_flight = InFlightBundles::default();
+        in_flight.record_submitted(txid(1), vec![0, 1, 2]);
+        assert!(!in_flight.is_eligible(0));
+        assert!(!in_flight.is_eligible(1));
+        assert!(!in_flight.is_eligible(2));
+        assert!(
+            in_flight.is_eligible(3),
+            "index in a different bundle stays eligible"
+        );
+    }
+
+    #[test]
+    fn in_flight_bundles_succeeded_finalizes_without_refund() {
+        let mut in_flight = InFlightBundles::default();
+        in_flight.record_submitted(txid(1), vec![0, 1]);
+
+        let refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
+            m6id: txid(1),
+            status: WithdrawalBundleStatus::Succeeded,
+        }]);
+
+        assert!(refunds.is_empty());
+        // Permanently excluded, not just "no longer pending".
+        assert!(!in_flight.is_eligible(0));
+        assert!(!in_flight.is_eligible(1));
+    }
+
+    #[test]
+    fn in_flight_bundles_failed_finalizes_and_refunds() {
+        let mut in_flight = InFlightBundles::default();
+        in_flight.record_submitted(txid(1), vec![0, 1]);
+
+        let mut refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
+            m6id: txid(1),
+            status: WithdrawalBundleStatus::Failed,
+        }]);
+        refunds.sort_unstable();
+
+        assert_eq!(refunds, vec![0, 1]);
+        // Refunded requests must never be selected again either — otherwise a later bundle
+        // could pay them out on Bitcoin *and* they'd have already been refunded on L2.
+        assert!(!in_flight.is_eligible(0));
+        assert!(!in_flight.is_eligible(1));
+    }
+
+    #[test]
+    fn in_flight_bundles_submitted_status_is_a_no_op() {
+        let mut in_flight = InFlightBundles::default();
+        in_flight.record_submitted(txid(1), vec![0]);
+
+        let refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
+            m6id: txid(1),
+            status: WithdrawalBundleStatus::Submitted,
+        }]);
+
+        assert!(refunds.is_empty());
+        assert!(!in_flight.is_eligible(0), "still pending, not yet resolved");
+    }
+
+    #[test]
+    fn in_flight_bundles_ignores_outcomes_for_untracked_bundles() {
+        let mut in_flight = InFlightBundles::default();
+        // No `record_submitted` call — e.g. another producer's bundle, or ours from before a
+        // restart (see the module doc comment).
+        let refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
+            m6id: txid(9),
+            status: WithdrawalBundleStatus::Failed,
+        }]);
+        assert!(refunds.is_empty());
     }
 }

@@ -1607,6 +1607,7 @@ dependencies = [
  "miette",
  "prost",
  "prost-build",
+ "prost-types",
  "protox",
  "reth-basic-payload-builder",
  "reth-chainspec",

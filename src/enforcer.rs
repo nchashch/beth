@@ -5,13 +5,16 @@
 use std::fmt;
 
 use alloy_primitives::{Address, B256};
+use bitcoin::hashes::Hash as _;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::proto::cusf::{
     common::v1::ReverseHex,
     mainchain::v1::{
-        GetBmmHStarCommitmentRequest, GetChainTipRequest, GetTwoWayPegDataRequest, block_info,
-        get_bmm_h_star_commitment_response, validator_service_client::ValidatorServiceClient,
+        BroadcastWithdrawalBundleRequest, GetBmmHStarCommitmentRequest, GetChainTipRequest,
+        GetTwoWayPegDataRequest, block_info, get_bmm_h_star_commitment_response,
+        validator_service_client::ValidatorServiceClient,
+        wallet_service_client::WalletServiceClient, withdrawal_bundle_event,
     },
 };
 
@@ -45,6 +48,10 @@ impl EnforcerClient {
 
     fn client(&self) -> ValidatorServiceClient<Channel> {
         ValidatorServiceClient::new(self.channel.clone())
+    }
+
+    fn wallet_client(&self) -> WalletServiceClient<Channel> {
+        WalletServiceClient::new(self.channel.clone())
     }
 
     /// Returns the current mainchain tip's block hash.
@@ -168,12 +175,115 @@ impl EnforcerClient {
             Ok(deposits)
         })
     }
+
+    /// Broadcasts a BIP300 withdrawal bundle ("M6" transaction) — a *real* BIP300 withdrawal,
+    /// this sidechain -> Bitcoin mainchain (see `crate::withdrawal_bundle`'s module doc comment
+    /// for the naming distinction from the EIP-4895 `Withdrawal`s used elsewhere in this crate
+    /// to mint deposits). `tx` should be blinded (no inputs) — the enforcer's wallet attaches
+    /// the mainchain CTIP-spending input itself.
+    pub fn broadcast_withdrawal_bundle(
+        &self,
+        sidechain_id: u32,
+        tx: &bitcoin::Transaction,
+    ) -> Result<(), EnforcerError> {
+        self.handle.block_on(async {
+            let request = BroadcastWithdrawalBundleRequest {
+                sidechain_id: Some(sidechain_id),
+                transaction: Some(bitcoin::consensus::encode::serialize(tx)),
+            };
+            self.wallet_client()
+                .broadcast_withdrawal_bundle(request)
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Returns BIP300 withdrawal-bundle outcome events for `sidechain_id`, recorded in
+    /// mainchain blocks after `start_block_hash` (exclusive) up to and including
+    /// `end_block_hash`. Same range semantics as [`Self::deposits`].
+    pub fn withdrawal_bundle_events(
+        &self,
+        sidechain_id: u32,
+        start_block_hash: Option<B256>,
+        end_block_hash: B256,
+    ) -> Result<Vec<WithdrawalBundleOutcome>, EnforcerError> {
+        self.handle.block_on(async {
+            let request = GetTwoWayPegDataRequest {
+                sidechain_id: Some(sidechain_id),
+                start_block_hash: start_block_hash.map(|hash| ReverseHex {
+                    hex: Some(hex::encode(hash)),
+                }),
+                end_block_hash: Some(ReverseHex {
+                    hex: Some(hex::encode(end_block_hash)),
+                }),
+            };
+            let response = self
+                .client()
+                .get_two_way_peg_data(request)
+                .await?
+                .into_inner();
+
+            let mut outcomes = Vec::new();
+            for block in response.blocks {
+                let Some(block_info) = block.block_info else {
+                    continue;
+                };
+                for event in block_info.events {
+                    let Some(block_info::event::Event::WithdrawalBundle(bundle_event)) =
+                        event.event
+                    else {
+                        // Not a withdrawal bundle event — e.g. a deposit. Not handled here.
+                        continue;
+                    };
+                    let m6id_hex = bundle_event
+                        .m6id
+                        .and_then(|m6id| m6id.hex)
+                        .ok_or(EnforcerError::MissingField("m6id"))?;
+                    let m6id = parse_txid_consensus(&m6id_hex)?;
+                    let Some(status) = bundle_event.event.and_then(|event| event.event) else {
+                        continue;
+                    };
+                    let status = match status {
+                        withdrawal_bundle_event::event::Event::Submitted(_) => {
+                            WithdrawalBundleStatus::Submitted
+                        }
+                        withdrawal_bundle_event::event::Event::Succeeded(_) => {
+                            WithdrawalBundleStatus::Succeeded
+                        }
+                        withdrawal_bundle_event::event::Event::Failed(_) => {
+                            WithdrawalBundleStatus::Failed
+                        }
+                    };
+                    outcomes.push(WithdrawalBundleOutcome { m6id, status });
+                }
+            }
+            Ok(outcomes)
+        })
+    }
 }
 
 /// A BIP300 two-way-peg deposit onto this sidechain.
 pub struct Deposit {
     pub address: Address,
     pub value_sats: u64,
+}
+
+/// A BIP300 withdrawal bundle's ("M6" transaction's) status on Bitcoin mainchain, as reported by
+/// the enforcer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalBundleStatus {
+    /// Proposed, awaiting mainchain miner votes (acks).
+    Submitted,
+    /// Reached the ack threshold and was mined into a mainchain block.
+    Succeeded,
+    /// Failed to reach the ack threshold before `withdrawal_bundle_max_age` expired.
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WithdrawalBundleOutcome {
+    pub m6id: bitcoin::Txid,
+    pub status: WithdrawalBundleStatus,
 }
 
 fn strip_0x(hex_str: &str) -> &str {
@@ -193,6 +303,20 @@ fn parse_address(hex_str: &str) -> Result<Address, EnforcerError> {
     let bytes = hex::decode(strip_0x(hex_str))
         .map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))?;
     Address::try_from(bytes.as_slice()).map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))
+}
+
+/// Parses a `ConsensusHex`-encoded txid — i.e. raw/internal byte order, as used by
+/// `bitcoin::consensus::Encodable`/`Decodable`. Deliberately does **not** go through `Txid`'s
+/// `FromStr`/`Display`, which reverse bytes for human-readable hex (Bitcoin's usual txid
+/// convention, documented on `bitcoin::Txid` itself) — that reversal would silently produce the
+/// wrong `Txid` here, since the enforcer's `m6id` field is `ConsensusHex`, not `ReverseHex`.
+fn parse_txid_consensus(hex_str: &str) -> Result<bitcoin::Txid, EnforcerError> {
+    let bytes = hex::decode(strip_0x(hex_str))
+        .map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))?;
+    Ok(bitcoin::Txid::from_byte_array(array))
 }
 
 #[derive(Debug, thiserror::Error)]

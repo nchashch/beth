@@ -13,11 +13,13 @@ use protox::prost::Message as _;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const COMMON_PROTO: &str = "../bip300301_enforcer/proto/cusf/common/v1/common.proto";
     const VALIDATOR_PROTO: &str = "../bip300301_enforcer/proto/cusf/mainchain/v1/validator.proto";
-    const PROTOS: &[&str] = &[COMMON_PROTO, VALIDATOR_PROTO];
+    const WALLET_PROTO: &str = "../bip300301_enforcer/proto/cusf/mainchain/v1/wallet.proto";
+    const PROTOS: &[&str] = &[COMMON_PROTO, VALIDATOR_PROTO, WALLET_PROTO];
     const INCLUDES: &[&str] = &["../bip300301_enforcer/proto"];
 
     println!("cargo:rerun-if-changed={COMMON_PROTO}");
     println!("cargo:rerun-if-changed={VALIDATOR_PROTO}");
+    println!("cargo:rerun-if-changed={WALLET_PROTO}");
 
     let file_descriptor_set = protox::compile(PROTOS, INCLUDES)?;
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));

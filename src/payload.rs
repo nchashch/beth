@@ -17,13 +17,14 @@
 //! malicious block producer could currently fabricate withdrawals. That verification is the
 //! natural next piece of work here.
 //!
-//! This builder also reads [`crate::withdrawal_bundle`]'s queue on every block and selects a
-//! BIP300 withdrawal bundle (a *real* BIP300 withdrawal, sidechain -> mainchain — see that
-//! module's doc comment) if one fits, logging it. It does not yet broadcast the bundle to the
-//! enforcer or write anything back to `WithdrawalRequestQueue` — see that module's doc comment
-//! for what's missing before this is more than a read-only preview.
+//! This builder also reads [`crate::withdrawal_bundle`]'s queue on every block, selects a real
+//! BIP300 withdrawal bundle (sidechain -> mainchain) if one fits, and broadcasts it to the
+//! enforcer. Once a bundle's outcome (succeeded/failed) is observed, failed bundles' requests
+//! are refunded — as EIP-4895 `Withdrawal`s again, same mechanism as deposits. See
+//! [`crate::withdrawal_bundle`]'s module doc comment for the significant restart-safety caveat
+//! on how in-flight bundles are tracked.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // EIP-4895 `Withdrawal` — repurposed here to mint BIP300 deposits. See the module doc comment
 // for why this is not a BIP300 withdrawal (which goes the other direction, L2 -> L1).
@@ -72,10 +73,14 @@ pub struct Bip300301PayloadBuilder<Pool, Client, EvmConfig = EthEvmConfig> {
     builder_config: EthereumBuilderConfig,
     enforcer: EnforcerClient,
     sidechain_id: u32,
+    /// Shared (not per-clone) so every handle to this payload builder sees the same in-flight
+    /// bundle tracking. See `crate::withdrawal_bundle`'s module doc comment for its
+    /// restart-safety caveat.
+    in_flight: Arc<Mutex<withdrawal_bundle::InFlightBundles>>,
 }
 
 impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
-    pub const fn new(
+    pub fn new(
         client: Client,
         pool: Pool,
         evm_config: EvmConfig,
@@ -90,6 +95,7 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
             builder_config,
             enforcer,
             sidechain_id,
+            in_flight: Arc::new(Mutex::new(withdrawal_bundle::InFlightBundles::default())),
         }
     }
 
@@ -102,8 +108,10 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
     /// A `parent_extra_data` that isn't a valid 32-byte mainchain hash (e.g. building directly
     /// on genesis, which carries no BIP301 provenance) is treated as "start of history".
     ///
-    /// Also previews a BIP300 withdrawal bundle (see [`crate::withdrawal_bundle`]) built from
-    /// `parent_hash`/`parent_number`'s state — logged, not yet acted on.
+    /// Also drives the BIP300 withdrawal-bundle lifecycle from `parent_hash`/`parent_number`'s
+    /// state: resolves outcomes for previously broadcast bundles (refunding failed ones, as
+    /// more EIP-4895 `Withdrawal`s), then selects and broadcasts a new bundle from whatever's
+    /// left eligible in [`crate::withdrawal_bundle`]'s queue, if one fits.
     fn next_block_context(
         &self,
         parent_extra_data: &Bytes,
@@ -125,11 +133,10 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
             .map_err(PayloadBuilderError::other)?;
         // Mint each BIP300 deposit as an EIP-4895 `Withdrawal` (Ethereum-protocol sense — this
         // credits the address directly, no BIP300 sidechain-to-mainchain transfer involved).
-        let withdrawals = deposits
+        let mut withdrawals: Vec<Withdrawal> = deposits
             .into_iter()
-            .enumerate()
-            .map(|(index, deposit)| Withdrawal {
-                index: index as u64,
+            .map(|deposit| Withdrawal {
+                index: 0, // reassigned below, once refunds are appended too
                 validator_index: 0,
                 address: deposit.address,
                 amount: deposit.value_sats.saturating_mul(GWEI_PER_SAT),
@@ -141,23 +148,81 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
             .clone()
             .with_extra_data(Bytes::copy_from_slice(main_tip.as_slice()));
 
-        // Preview a BIP300 withdrawal bundle (sidechain -> mainchain), if one fits. Not yet
-        // broadcast to the enforcer, and not yet accounted for in the block itself — see
-        // `crate::withdrawal_bundle`'s module doc comment for what's missing. A failure here is
-        // deliberately non-fatal: nothing in the block depends on this yet.
+        // Drive the BIP300 withdrawal-bundle lifecycle (sidechain -> mainchain). A failure here
+        // is deliberately non-fatal: this subsystem isn't consensus-critical yet (see
+        // `crate::withdrawal_bundle`'s module doc comment), so a broken enforcer/network
+        // shouldn't halt block production.
         let next_block_number = u32::try_from(parent_number.saturating_add(1)).unwrap_or(u32::MAX);
         match self.client.state_by_block_hash(parent_hash) {
             Ok(state) => match withdrawal_bundle::read_pending_withdrawals(state.as_ref()) {
                 Ok(pending) => {
+                    // Resolve outcomes for bundles we've previously broadcast. Refund requests
+                    // whose bundle failed — same mechanism as deposits, another EIP-4895 credit.
+                    match self.enforcer.withdrawal_bundle_events(
+                        self.sidechain_id,
+                        parent_main_hash,
+                        main_tip,
+                    ) {
+                        Ok(outcomes) => {
+                            let to_refund = self.in_flight.lock().unwrap().resolve(&outcomes);
+                            for index in to_refund {
+                                let Some(request) =
+                                    pending.iter().find(|request| request.index == index)
+                                else {
+                                    tracing::warn!(
+                                        index,
+                                        "refund target missing from WithdrawalRequestQueue",
+                                    );
+                                    continue;
+                                };
+                                tracing::info!(index, "refunding failed withdrawal bundle request");
+                                withdrawals.push(Withdrawal {
+                                    index: 0,
+                                    validator_index: 0,
+                                    address: request.requester,
+                                    amount: (request.value_sats + request.main_fee_sats)
+                                        .saturating_mul(GWEI_PER_SAT),
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "failed to fetch withdrawal bundle events");
+                        }
+                    }
+
+                    // Select and broadcast a new bundle from whatever's left eligible.
+                    let eligible: Vec<_> = {
+                        let in_flight = self.in_flight.lock().unwrap();
+                        pending
+                            .into_iter()
+                            .filter(|request| in_flight.is_eligible(request.index))
+                            .collect()
+                    };
                     if let Some(bundle) =
-                        withdrawal_bundle::select_withdrawal_bundle(&pending, next_block_number)
+                        withdrawal_bundle::select_withdrawal_bundle(&eligible, next_block_number)
                     {
-                        tracing::debug!(
-                            m6id = %bundle.m6id(),
-                            requests = ?bundle.request_indices,
-                            outputs = bundle.tx.output.len(),
-                            "previewed BIP300 withdrawal bundle (not broadcast)",
-                        );
+                        match self
+                            .enforcer
+                            .broadcast_withdrawal_bundle(self.sidechain_id, &bundle.tx)
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    m6id = %bundle.m6id(),
+                                    requests = ?bundle.request_indices,
+                                    outputs = bundle.tx.output.len(),
+                                    "broadcast BIP300 withdrawal bundle",
+                                );
+                                self.in_flight
+                                    .lock()
+                                    .unwrap()
+                                    .record_submitted(bundle.m6id(), bundle.request_indices);
+                            }
+                            Err(err) => {
+                                // Not tracked as in-flight — it'll be reselected (and
+                                // re-attempted) on a future block.
+                                tracing::warn!(%err, m6id = %bundle.m6id(), "failed to broadcast withdrawal bundle");
+                            }
+                        }
                     }
                 }
                 Err(err) => {
@@ -165,8 +230,12 @@ impl<Pool, Client, EvmConfig> Bip300301PayloadBuilder<Pool, Client, EvmConfig> {
                 }
             },
             Err(err) => {
-                tracing::warn!(%err, "failed to load parent state for withdrawal bundle preview");
+                tracing::warn!(%err, "failed to load parent state for withdrawal bundle processing");
             }
+        }
+
+        for (index, withdrawal) in withdrawals.iter_mut().enumerate() {
+            withdrawal.index = index as u64;
         }
 
         Ok((builder_config, withdrawals))
