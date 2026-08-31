@@ -5,22 +5,39 @@ pragma solidity ^0.8.24;
 /// for the block-production layer to batch into withdrawal bundles (M6 transactions) and submit
 /// to the BIP300/301 enforcer. See `beth`'s `src/payload.rs`/`src/enforcer.rs` for the deposit
 /// side (mainchain -> sidechain), which this contract is the reverse-direction counterpart to,
-/// and `src/withdrawal_bundle.rs` for the bundle-selection/M6-construction logic that reads this
-/// queue.
+/// and `src/withdrawal_bundle.rs` for the bundle-selection/M6-construction logic that reads and
+/// writes this queue.
 ///
 /// Deployed at a fixed predeploy address from genesis (see `genesis.json`) — this file is the
 /// human-readable source; deployment ships the compiled runtime bytecode directly via
 /// `alloc[address].code`, so there is no constructor and no deployment transaction.
 ///
-/// This contract only accepts and records requests. It does not yet mark requests as bundled,
-/// confirmed, or failed — that requires the block-production layer to write back bundle
-/// outcomes (learned from the enforcer's `WithdrawalBundleEvent`s) once that side is built. Until
-/// then, every request in the queue is a candidate on every block (see `src/withdrawal_bundle.rs`
-/// module doc comment).
+/// A request's lifecycle (`status`) is written back by `systemReportBundleLifecycle` — see its
+/// doc comment for why that's restricted to `SYSTEM_ADDRESS` and how every node computes
+/// identical calls to it, rather than trusting whatever the block producer claims.
 contract WithdrawalRequestQueue {
+    /// The sender every EIP-4788/2935/7002-style "system call" (a call executed directly by the
+    /// block-building/validation machinery, with no transaction and no signature) uses as
+    /// `msg.sender`. No externally-owned account controls this address's key, so nothing but the
+    /// protocol itself can ever satisfy `msg.sender == SYSTEM_ADDRESS`.
+    address private constant SYSTEM_ADDRESS = 0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE;
+
     /// wei per satoshi, matching the deposit side's `10^10` scaling (see `payload.rs`), so the L2
     /// asset preserves BTC's 8 decimals of precision.
     uint256 private constant WEI_PER_SAT = 1e10;
+
+    /// A request's position in the BIP300 withdrawal-bundle lifecycle.
+    ///
+    /// `Pending`: eligible for selection into a new bundle.
+    /// `Bundled`: assigned to `bundleM6id`, awaiting that bundle's mainchain outcome.
+    /// `Confirmed`: its bundle succeeded — the BTC payout already happened, so the locked wei
+    /// stays in this contract permanently (its job is done; there is nothing left to refund).
+    /// `Refunded`: its bundle failed — the locked wei has been transferred back to `requester`.
+    /// `Bundled`, `Confirmed`, and `Refunded` are all permanently ineligible for reselection.
+    uint8 private constant STATUS_PENDING = 0;
+    uint8 private constant STATUS_BUNDLED = 1;
+    uint8 private constant STATUS_CONFIRMED = 2;
+    uint8 private constant STATUS_REFUNDED = 3;
 
     /// A single pending withdrawal request. `btcDestination` is opaque to this contract — it is
     /// interpreted by the block-production layer as a raw Bitcoin scriptPubKey when constructing
@@ -36,6 +53,11 @@ contract WithdrawalRequestQueue {
         /// thunder's wallet selecting coins covering `value + main_fee`.
         uint256 mainFeeSats;
         bytes btcDestination;
+        /// One of the `STATUS_*` constants above.
+        uint8 status;
+        /// The bundle this request is (or was) assigned to. Meaningless while `status ==
+        /// STATUS_PENDING`.
+        bytes32 bundleM6id;
     }
 
     /// Total number of requests ever queued; also the next index to be assigned.
@@ -51,7 +73,9 @@ contract WithdrawalRequestQueue {
     /// right-aligned — alone in its slot since the following field is a full `uint256`),
     /// `valueSats` (slot 1), `mainFeeSats` (slot 2), `btcDestination` (slot 3, Solidity's
     /// standard dynamic `bytes` encoding — inline with a `length * 2` marker if `length <= 31`,
-    /// else a `length * 2 + 1` marker with data starting at `keccak256(entry_slot + 3)`).
+    /// else a `length * 2 + 1` marker with data starting at `keccak256(entry_slot + 3)`),
+    /// `status` (slot 4, right-aligned single byte — alone in its slot since the following field
+    /// is a full `bytes32`), `bundleM6id` (slot 5).
     mapping(uint256 => Request) public requests;
 
     event WithdrawalRequested(
@@ -61,6 +85,10 @@ contract WithdrawalRequestQueue {
         uint256 mainFeeSats,
         bytes btcDestination
     );
+
+    event WithdrawalBundled(uint256 indexed index, bytes32 indexed m6id);
+    event WithdrawalConfirmed(uint256 indexed index, bytes32 indexed m6id);
+    event WithdrawalRefunded(uint256 indexed index, bytes32 indexed m6id, bool transferSucceeded);
 
     /// Queues a withdrawal request. `msg.value` must equal `(valueSats + mainFeeSats) *
     /// 10^10` wei, locked in this contract until bundled and confirmed — or released back to
@@ -78,7 +106,65 @@ contract WithdrawalRequestQueue {
         uint256 valueSats = totalSats - mainFeeSats;
 
         index = requestCount++;
-        requests[index] = Request(msg.sender, valueSats, mainFeeSats, btcDestination);
+        requests[index] = Request(msg.sender, valueSats, mainFeeSats, btcDestination, STATUS_PENDING, bytes32(0));
         emit WithdrawalRequested(index, msg.sender, valueSats, mainFeeSats, btcDestination);
+    }
+
+    /// Advances the withdrawal-bundle lifecycle for one block. Callable only via a "system
+    /// call" (see `SYSTEM_ADDRESS`) — never by a normal transaction.
+    ///
+    /// Every argument here is *independently recomputed by every node* from data they already
+    /// have to agree on: `bundledIndices`/`newM6id` from a pure, deterministic function of this
+    /// contract's own `Pending` requests (`beth`'s `select_withdrawal_bundle`); the resolution
+    /// lists from the BIP300/301 enforcer's report of mainchain events for this block's own
+    /// committed mainchain range. Because every node computes the same call independently, this
+    /// being system-only isn't "trust the caller" — it's "only the protocol can trigger this
+    /// state transition," the same property EIP-4895 withdrawals already have for balances. See
+    /// `src/withdrawal_bundle.rs`'s module doc comment for the full picture.
+    ///
+    /// - `bundledIndices`: requests newly assigned to `newM6id` (empty if no bundle was selected
+    ///   this block). Each must currently be `STATUS_PENDING`.
+    /// - `succeededIndices` / `failedIndices`: requests whose bundle just resolved. Each must
+    ///   currently be `STATUS_BUNDLED`. Failed requests are refunded here, from this contract's
+    ///   own held balance (locked at request time) — not minted.
+    function systemReportBundleLifecycle(
+        uint256[] calldata bundledIndices,
+        bytes32 newM6id,
+        uint256[] calldata succeededIndices,
+        uint256[] calldata failedIndices
+    ) external {
+        require(msg.sender == SYSTEM_ADDRESS, "WithdrawalRequestQueue: not a system call");
+
+        for (uint256 i = 0; i < bundledIndices.length; i++) {
+            uint256 index = bundledIndices[i];
+            require(requests[index].status == STATUS_PENDING, "WithdrawalRequestQueue: not pending");
+            requests[index].status = STATUS_BUNDLED;
+            requests[index].bundleM6id = newM6id;
+            emit WithdrawalBundled(index, newM6id);
+        }
+
+        for (uint256 i = 0; i < succeededIndices.length; i++) {
+            uint256 index = succeededIndices[i];
+            require(requests[index].status == STATUS_BUNDLED, "WithdrawalRequestQueue: not bundled");
+            requests[index].status = STATUS_CONFIRMED;
+            emit WithdrawalConfirmed(index, requests[index].bundleM6id);
+        }
+
+        for (uint256 i = 0; i < failedIndices.length; i++) {
+            uint256 index = failedIndices[i];
+            Request storage request = requests[index];
+            require(request.status == STATUS_BUNDLED, "WithdrawalRequestQueue: not bundled");
+            bytes32 m6id = request.bundleM6id;
+            // Checks-effects-interactions: mark refunded *before* the external call below, so a
+            // reentrant call can't observe or act on a still-"bundled" request.
+            request.status = STATUS_REFUNDED;
+            uint256 amountWei = (request.valueSats + request.mainFeeSats) * WEI_PER_SAT;
+            (bool success,) = payable(request.requester).call{value: amountWei}("");
+            // A failed transfer (e.g. `requester` is a contract that reverts) does not revert
+            // this call — that would block unrelated requests' resolutions in the same block.
+            // The wei stays locked in this contract; `status` is still `STATUS_REFUNDED`, so
+            // this is never retried.
+            emit WithdrawalRefunded(index, m6id, success);
+        }
     }
 }

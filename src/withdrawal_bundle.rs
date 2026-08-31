@@ -13,26 +13,23 @@
 //! [`requests_commitment`]). `btcDestination` here is a raw scriptPubKey rather than a parsed
 //! `bitcoin::Address`, avoiding an address-format/network round-trip.
 //!
-//! [`InFlightBundles`] tracks broadcast-but-unresolved bundles and permanently-finalized
-//! request indices (paid out, or refunded after a failed bundle), so [`Bip300301PayloadBuilder`]
-//! doesn't keep re-selecting requests that are already spoken for. This is **not** a
-//! `WithdrawalRequestQueue` write-back — the contract still has no "bundled" status field, so
-//! [`read_pending_withdrawals`] always returns every request ever queued, unfiltered.
-//! [`InFlightBundles`] lives only in this process's memory: it does not survive a restart, is
-//! not shared across multiple block-producing nodes, and is not verified by
-//! `Bip300301Consensus` at all. A restart forgets every in-flight/finalized index, so every
-//! previously-succeeded-or-refunded request becomes selectable again — risking a duplicate
-//! Bitcoin payout (for a previously-succeeded bundle) or a duplicate refund (for a
-//! previously-failed one). Fixing this properly needs the bundle/request status to live
-//! on-chain in `WithdrawalRequestQueue`, written back by a trusted (signed or system-call)
-//! transaction — out of scope here; this in-memory version is the pragmatic middle step.
-//!
-//! [`Bip300301PayloadBuilder`]: crate::payload::Bip300301PayloadBuilder
+//! Request lifecycle (`status`/`bundleM6id`, see the contract) is written back by
+//! [`crate::evm`]'s "system call" — a protocol-level `WithdrawalRequestQueue.
+//! systemReportBundleLifecycle(...)` call executed directly by block building/validation, with
+//! no transaction and no signature, gated by `msg.sender == SYSTEM_ADDRESS` (the same mechanism
+//! EIP-4788/2935/7002 use). [`compute_lifecycle_update`] is the *single* function that decides
+//! what that call should say, called identically by every node (whether building a new block or
+//! validating any other) — see its doc comment. This means bundle/request state lives entirely
+//! in `WithdrawalRequestQueue`'s own contract storage: it's part of the state root like anything
+//! else, so it's automatically persisted, reorg-safe, and identical across every node — no
+//! process-local tracking (this module used to have an in-memory `InFlightBundles` for exactly
+//! that reason) or trusted signer required.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256, U256, address, keccak256};
-use bitcoin::script::PushBytesBuf;
+use alloy_sol_types::{SolCall, sol};
+use bitcoin::{hashes::Hash as _, script::PushBytesBuf};
 use reth_storage_api::{StateProvider, errors::provider::ProviderResult};
 
 use crate::enforcer::{WithdrawalBundleOutcome, WithdrawalBundleStatus};
@@ -47,42 +44,99 @@ const REQUEST_COUNT_SLOT: B256 = B256::ZERO;
 /// Storage slot of the `WithdrawalRequestQueue.requests` mapping itself (not an entry's slot).
 const REQUESTS_MAPPING_SLOT: u64 = 1;
 
-/// A single pending withdrawal request read from `WithdrawalRequestQueue`.
+/// A request's position in the BIP300 withdrawal-bundle lifecycle. Mirrors the contract's
+/// `STATUS_*` constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestStatus {
+    Pending,
+    Bundled,
+    Confirmed,
+    Refunded,
+}
+
+/// A single withdrawal request read from `WithdrawalRequestQueue`, at any point in its
+/// lifecycle.
+#[derive(Debug, Clone)]
+pub struct RequestEntry {
+    pub index: u64,
+    pub value_sats: u64,
+    pub main_fee_sats: u64,
+    /// A raw Bitcoin scriptPubKey (see the contract's doc comment).
+    pub btc_destination: Vec<u8>,
+    pub status: RequestStatus,
+    /// `Some` iff `status` is `Bundled`, `Confirmed`, or `Refunded`.
+    pub bundle_m6id: Option<bitcoin::Txid>,
+}
+
+/// A single `Pending` withdrawal request — i.e. one eligible for selection into a new bundle.
+/// A view over [`RequestEntry`]'s fields relevant to [`select_withdrawal_bundle`].
 #[derive(Debug, Clone)]
 pub struct PendingWithdrawal {
     pub index: u64,
-    pub requester: Address,
     pub value_sats: u64,
     pub main_fee_sats: u64,
     /// A raw Bitcoin scriptPubKey (see the contract's doc comment).
     pub btc_destination: Vec<u8>,
 }
 
-/// Reads every request in `WithdrawalRequestQueue` (`requests[0..requestCount]`) from `state`.
-///
-/// See the module doc comment: this does not know which requests have already been bundled, so
-/// it always returns the full queue.
-pub fn read_pending_withdrawals(
-    state: &dyn StateProvider,
-) -> ProviderResult<Vec<PendingWithdrawal>> {
+/// Reads every request in `WithdrawalRequestQueue` (`requests[0..requestCount]`) from `state`,
+/// at whatever point in its lifecycle it currently is.
+pub fn read_all_requests(state: &dyn StateProvider) -> ProviderResult<Vec<RequestEntry>> {
     let request_count = read_u64(state, REQUEST_COUNT_SLOT)?;
 
-    let mut withdrawals = Vec::with_capacity(request_count as usize);
+    let mut requests = Vec::with_capacity(request_count as usize);
     for index in 0..request_count {
         let base = requests_entry_slot(index);
-        let requester = read_address(state, base)?;
+        // Slot `base` itself (`requester`) is intentionally not read here — no code path
+        // currently needs it, since refunds are paid out inside the contract itself (see
+        // `WithdrawalRequestQueue.systemReportBundleLifecycle`), not by this reader.
         let value_sats = read_u64(state, add_slot(base, 1))?;
         let main_fee_sats = read_u64(state, add_slot(base, 2))?;
         let btc_destination = read_dynamic_bytes(state, add_slot(base, 3))?;
-        withdrawals.push(PendingWithdrawal {
+        let status = match read_u64(state, add_slot(base, 4))? {
+            0 => RequestStatus::Pending,
+            1 => RequestStatus::Bundled,
+            2 => RequestStatus::Confirmed,
+            // Anything else shouldn't be reachable given the contract's own state machine, but
+            // don't panic on unexpected on-chain data — treat it as terminal/ineligible.
+            _ => RequestStatus::Refunded,
+        };
+        let bundle_m6id = match status {
+            RequestStatus::Pending => None,
+            _ => {
+                let word = state
+                    .storage(WITHDRAWAL_REQUEST_QUEUE_ADDRESS, add_slot(base, 5))?
+                    .unwrap_or_default();
+                Some(bitcoin::Txid::from_byte_array(word.to_be_bytes::<32>()))
+            }
+        };
+        requests.push(RequestEntry {
             index,
-            requester,
             value_sats,
             main_fee_sats,
             btc_destination,
+            status,
+            bundle_m6id,
         });
     }
-    Ok(withdrawals)
+    Ok(requests)
+}
+
+/// Reads every `Pending` request in `WithdrawalRequestQueue` from `state` — the candidates for
+/// [`select_withdrawal_bundle`].
+pub fn read_pending_withdrawals(
+    state: &dyn StateProvider,
+) -> ProviderResult<Vec<PendingWithdrawal>> {
+    Ok(read_all_requests(state)?
+        .into_iter()
+        .filter(|request| request.status == RequestStatus::Pending)
+        .map(|request| PendingWithdrawal {
+            index: request.index,
+            value_sats: request.value_sats,
+            main_fee_sats: request.main_fee_sats,
+            btc_destination: request.btc_destination,
+        })
+        .collect())
 }
 
 /// The base storage slot of `requests[index]`, per Solidity's `mapping(uint256 => T)` layout:
@@ -96,13 +150,6 @@ fn requests_entry_slot(index: u64) -> B256 {
 
 fn add_slot(slot: B256, offset: u64) -> B256 {
     B256::from(U256::from_be_bytes(slot.0) + U256::from(offset))
-}
-
-fn read_address(state: &dyn StateProvider, slot: B256) -> ProviderResult<Address> {
-    let value = state
-        .storage(WITHDRAWAL_REQUEST_QUEUE_ADDRESS, slot)?
-        .unwrap_or_default();
-    Ok(Address::from_slice(&value.to_be_bytes::<32>()[12..32]))
 }
 
 fn read_u64(state: &dyn StateProvider, slot: B256) -> ProviderResult<u64> {
@@ -429,59 +476,111 @@ const fn predict_weight(n_outputs: u32, sum_txout_sizes: u32) -> Option<bitcoin:
     }
 }
 
-/// Tracks BIP300 withdrawal bundles broadcast but not yet resolved, and every request index
-/// that must never be selected again. See the module doc comment for the (significant)
-/// restart-safety caveat.
-#[derive(Debug, Default)]
-pub struct InFlightBundles {
-    /// m6id -> the request indices it consumed, for bundles broadcast but not yet resolved.
-    pending: HashMap<bitcoin::Txid, Vec<u64>>,
-    /// Every request index that must never be selected again: already paid out on Bitcoin, or
-    /// already refunded after its bundle failed.
-    finalized: HashSet<u64>,
+sol! {
+    /// Matches `WithdrawalRequestQueue.systemReportBundleLifecycle` exactly — see its doc
+    /// comment in `contracts/WithdrawalRequestQueue.sol`.
+    function systemReportBundleLifecycle(
+        uint256[] bundledIndices,
+        bytes32 newM6id,
+        uint256[] succeededIndices,
+        uint256[] failedIndices
+    ) external;
 }
 
-impl InFlightBundles {
-    /// Whether `index` may be selected into a new bundle: not already finalized, and not
-    /// consumed by a bundle that's still awaiting an outcome.
-    pub fn is_eligible(&self, index: u64) -> bool {
-        !self.finalized.contains(&index)
-            && !self
-                .pending
-                .values()
-                .any(|indices| indices.contains(&index))
+/// The `systemReportBundleLifecycle` call for one block: which `Pending` requests to newly
+/// assign to a bundle (if any fit), and which already-`Bundled` requests just resolved.
+#[derive(Debug, Clone, Default)]
+pub struct BundleLifecycleUpdate {
+    pub bundled_indices: Vec<u64>,
+    pub new_m6id: Option<bitcoin::Txid>,
+    pub succeeded_indices: Vec<u64>,
+    pub failed_indices: Vec<u64>,
+}
+
+impl BundleLifecycleUpdate {
+    /// Whether this update would actually change anything — if so, the caller can skip the
+    /// system call entirely for this block.
+    pub fn is_empty(&self) -> bool {
+        self.bundled_indices.is_empty()
+            && self.succeeded_indices.is_empty()
+            && self.failed_indices.is_empty()
     }
 
-    /// Records a newly broadcast bundle's consumed request indices.
-    pub fn record_submitted(&mut self, m6id: bitcoin::Txid, indices: Vec<u64>) {
-        self.pending.insert(m6id, indices);
-    }
-
-    /// Resolves `outcomes` against currently-tracked bundles: on `Succeeded`, the bundle's
-    /// requests are finalized (paid out, excluded forever). On `Failed`, they're also
-    /// finalized, and returned here so the caller can refund them — the caller must actually
-    /// credit those refunds, since this method only updates in-memory tracking. `Submitted` and
-    /// outcomes for untracked m6ids (e.g. another producer's bundle, or ours from before a
-    /// restart) are ignored.
-    pub fn resolve(&mut self, outcomes: &[WithdrawalBundleOutcome]) -> Vec<u64> {
-        let mut to_refund = Vec::new();
-        for outcome in outcomes {
-            match outcome.status {
-                WithdrawalBundleStatus::Succeeded => {
-                    if let Some(indices) = self.pending.remove(&outcome.m6id) {
-                        self.finalized.extend(indices);
-                    }
-                }
-                WithdrawalBundleStatus::Failed => {
-                    if let Some(indices) = self.pending.remove(&outcome.m6id) {
-                        self.finalized.extend(indices.iter().copied());
-                        to_refund.extend(indices);
-                    }
-                }
-                WithdrawalBundleStatus::Submitted => {}
-            }
+    /// ABI-encodes this as a `systemReportBundleLifecycle` call, ready for
+    /// `Evm::transact_system_call`.
+    pub fn to_calldata(&self) -> Vec<u8> {
+        systemReportBundleLifecycleCall {
+            bundledIndices: self
+                .bundled_indices
+                .iter()
+                .map(|&i| U256::from(i))
+                .collect(),
+            newM6id: B256::from(self.new_m6id.map_or([0u8; 32], |txid| txid.to_byte_array())),
+            succeededIndices: self
+                .succeeded_indices
+                .iter()
+                .map(|&i| U256::from(i))
+                .collect(),
+            failedIndices: self.failed_indices.iter().map(|&i| U256::from(i)).collect(),
         }
-        to_refund
+        .abi_encode()
+    }
+}
+
+/// Computes the `systemReportBundleLifecycle` call for one block — the *single* function both
+/// block building and block validation call (see [`crate::evm`]), so every node arrives at the
+/// identical call independently:
+/// - `succeeded_indices`/`failed_indices`: every `Bundled` request in `all_requests` whose
+///   `bundle_m6id` matches a `Succeeded`/`Failed` entry in `outcomes` — both are already-agreed
+///   data (`all_requests` is this contract's own state; `outcomes` is what every node's enforcer
+///   independently reports for this block's own committed mainchain range).
+/// - `bundled_indices`/`new_m6id`: [`select_withdrawal_bundle`] applied to whatever's left
+///   `Pending` in `all_requests` — a pure function of that same already-agreed state.
+pub fn compute_lifecycle_update(
+    all_requests: &[RequestEntry],
+    outcomes: &[WithdrawalBundleOutcome],
+    block_height: u32,
+) -> BundleLifecycleUpdate {
+    let mut succeeded_indices = Vec::new();
+    let mut failed_indices = Vec::new();
+    for outcome in outcomes {
+        let matching = all_requests
+            .iter()
+            .filter(|request| {
+                request.status == RequestStatus::Bundled
+                    && request.bundle_m6id == Some(outcome.m6id)
+            })
+            .map(|request| request.index);
+        match outcome.status {
+            WithdrawalBundleStatus::Succeeded => succeeded_indices.extend(matching),
+            WithdrawalBundleStatus::Failed => failed_indices.extend(matching),
+            WithdrawalBundleStatus::Submitted => {}
+        }
+    }
+
+    let pending: Vec<PendingWithdrawal> = all_requests
+        .iter()
+        .filter(|request| request.status == RequestStatus::Pending)
+        .map(|request| PendingWithdrawal {
+            index: request.index,
+            value_sats: request.value_sats,
+            main_fee_sats: request.main_fee_sats,
+            btc_destination: request.btc_destination.clone(),
+        })
+        .collect();
+    let (bundled_indices, new_m6id) = match select_withdrawal_bundle(&pending, block_height) {
+        Some(bundle) => {
+            let m6id = bundle.m6id();
+            (bundle.request_indices, Some(m6id))
+        }
+        None => (Vec::new(), None),
+    };
+
+    BundleLifecycleUpdate {
+        bundled_indices,
+        new_m6id,
+        succeeded_indices,
+        failed_indices,
     }
 }
 
@@ -497,7 +596,6 @@ mod tests {
     ) -> PendingWithdrawal {
         PendingWithdrawal {
             index,
-            requester: Address::ZERO,
             value_sats,
             main_fee_sats,
             btc_destination: destination.to_vec(),
@@ -652,87 +750,105 @@ mod tests {
     }
 
     fn txid(byte: u8) -> bitcoin::Txid {
-        use bitcoin::hashes::Hash as _;
         bitcoin::Txid::from_byte_array([byte; 32])
     }
 
-    #[test]
-    fn in_flight_bundles_starts_with_everything_eligible() {
-        let in_flight = InFlightBundles::default();
-        assert!(in_flight.is_eligible(0));
-        assert!(in_flight.is_eligible(42));
+    fn entry(
+        index: u64,
+        status: RequestStatus,
+        bundle_m6id: Option<bitcoin::Txid>,
+    ) -> RequestEntry {
+        RequestEntry {
+            index,
+            value_sats: 1_000,
+            main_fee_sats: 1,
+            btc_destination: vec![0xAA; 22],
+            status,
+            bundle_m6id,
+        }
     }
 
     #[test]
-    fn in_flight_bundles_excludes_submitted_indices() {
-        let mut in_flight = InFlightBundles::default();
-        in_flight.record_submitted(txid(1), vec![0, 1, 2]);
-        assert!(!in_flight.is_eligible(0));
-        assert!(!in_flight.is_eligible(1));
-        assert!(!in_flight.is_eligible(2));
-        assert!(
-            in_flight.is_eligible(3),
-            "index in a different bundle stays eligible"
-        );
+    fn compute_lifecycle_update_selects_from_pending_only() {
+        let all = vec![
+            entry(0, RequestStatus::Pending, None),
+            entry(1, RequestStatus::Bundled, Some(txid(1))),
+            entry(2, RequestStatus::Confirmed, Some(txid(2))),
+            entry(3, RequestStatus::Refunded, Some(txid(3))),
+        ];
+        let update = compute_lifecycle_update(&all, &[], 1);
+        assert_eq!(update.bundled_indices, vec![0]);
+        assert!(update.new_m6id.is_some());
+        assert!(update.succeeded_indices.is_empty());
+        assert!(update.failed_indices.is_empty());
     }
 
     #[test]
-    fn in_flight_bundles_succeeded_finalizes_without_refund() {
-        let mut in_flight = InFlightBundles::default();
-        in_flight.record_submitted(txid(1), vec![0, 1]);
-
-        let refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
+    fn compute_lifecycle_update_resolves_succeeded_bundle() {
+        let all = vec![
+            entry(0, RequestStatus::Bundled, Some(txid(1))),
+            entry(1, RequestStatus::Bundled, Some(txid(1))),
+            entry(2, RequestStatus::Bundled, Some(txid(2))),
+        ];
+        let outcomes = [WithdrawalBundleOutcome {
             m6id: txid(1),
             status: WithdrawalBundleStatus::Succeeded,
-        }]);
-
-        assert!(refunds.is_empty());
-        // Permanently excluded, not just "no longer pending".
-        assert!(!in_flight.is_eligible(0));
-        assert!(!in_flight.is_eligible(1));
+        }];
+        let update = compute_lifecycle_update(&all, &outcomes, 1);
+        assert_eq!(update.succeeded_indices, vec![0, 1]);
+        assert!(update.failed_indices.is_empty());
+        // No new bundle: nothing is `Pending`.
+        assert!(update.bundled_indices.is_empty());
     }
 
     #[test]
-    fn in_flight_bundles_failed_finalizes_and_refunds() {
-        let mut in_flight = InFlightBundles::default();
-        in_flight.record_submitted(txid(1), vec![0, 1]);
-
-        let mut refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
+    fn compute_lifecycle_update_resolves_failed_bundle() {
+        let all = vec![entry(0, RequestStatus::Bundled, Some(txid(1)))];
+        let outcomes = [WithdrawalBundleOutcome {
             m6id: txid(1),
             status: WithdrawalBundleStatus::Failed,
-        }]);
-        refunds.sort_unstable();
-
-        assert_eq!(refunds, vec![0, 1]);
-        // Refunded requests must never be selected again either — otherwise a later bundle
-        // could pay them out on Bitcoin *and* they'd have already been refunded on L2.
-        assert!(!in_flight.is_eligible(0));
-        assert!(!in_flight.is_eligible(1));
+        }];
+        let update = compute_lifecycle_update(&all, &outcomes, 1);
+        assert_eq!(update.failed_indices, vec![0]);
+        assert!(update.succeeded_indices.is_empty());
     }
 
     #[test]
-    fn in_flight_bundles_submitted_status_is_a_no_op() {
-        let mut in_flight = InFlightBundles::default();
-        in_flight.record_submitted(txid(1), vec![0]);
-
-        let refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
-            m6id: txid(1),
-            status: WithdrawalBundleStatus::Submitted,
-        }]);
-
-        assert!(refunds.is_empty());
-        assert!(!in_flight.is_eligible(0), "still pending, not yet resolved");
+    fn compute_lifecycle_update_ignores_submitted_and_untracked_m6ids() {
+        let all = vec![entry(0, RequestStatus::Bundled, Some(txid(1)))];
+        let outcomes = [
+            WithdrawalBundleOutcome {
+                m6id: txid(1),
+                status: WithdrawalBundleStatus::Submitted,
+            },
+            WithdrawalBundleOutcome {
+                m6id: txid(9),
+                status: WithdrawalBundleStatus::Failed,
+            },
+        ];
+        let update = compute_lifecycle_update(&all, &outcomes, 1);
+        assert!(update.succeeded_indices.is_empty());
+        assert!(update.failed_indices.is_empty());
     }
 
     #[test]
-    fn in_flight_bundles_ignores_outcomes_for_untracked_bundles() {
-        let mut in_flight = InFlightBundles::default();
-        // No `record_submitted` call — e.g. another producer's bundle, or ours from before a
-        // restart (see the module doc comment).
-        let refunds = in_flight.resolve(&[WithdrawalBundleOutcome {
-            m6id: txid(9),
-            status: WithdrawalBundleStatus::Failed,
-        }]);
-        assert!(refunds.is_empty());
+    fn compute_lifecycle_update_is_empty_when_nothing_changes() {
+        assert!(compute_lifecycle_update(&[], &[], 1).is_empty());
+    }
+
+    #[test]
+    fn bundle_lifecycle_update_to_calldata_round_trips_via_sol_decode() {
+        let update = BundleLifecycleUpdate {
+            bundled_indices: vec![0, 1],
+            new_m6id: Some(txid(7)),
+            succeeded_indices: vec![2],
+            failed_indices: vec![3, 4],
+        };
+        let calldata = update.to_calldata();
+        let decoded = systemReportBundleLifecycleCall::abi_decode(&calldata).expect("valid ABI");
+        assert_eq!(decoded.bundledIndices, vec![U256::from(0), U256::from(1)]);
+        assert_eq!(decoded.newM6id, B256::from(txid(7).to_byte_array()));
+        assert_eq!(decoded.succeededIndices, vec![U256::from(2)]);
+        assert_eq!(decoded.failedIndices, vec![U256::from(3), U256::from(4)]);
     }
 }

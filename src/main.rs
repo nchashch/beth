@@ -1,6 +1,7 @@
 mod chainspec;
 mod consensus;
 mod enforcer;
+mod evm;
 mod payload;
 mod proto;
 mod withdrawal_bundle;
@@ -9,6 +10,7 @@ use chainspec::BethChainSpecParser;
 use clap::Parser;
 use consensus::Bip300301ConsensusBuilder;
 use enforcer::EnforcerClient;
+use evm::Bip300301ExecutorBuilder;
 use payload::Bip300301PayloadBuilderBuilder;
 use reth_ethereum_cli::interface::Cli;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -33,6 +35,10 @@ fn main() -> eyre::Result<()> {
             .with_types::<EthereumNode>()
             .with_components(
                 EthereumNode::components()
+                    .executor(Bip300301ExecutorBuilder::new(
+                        enforcer.clone(),
+                        sidechain_id,
+                    ))
                     .consensus(Bip300301ConsensusBuilder::new(
                         enforcer.clone(),
                         sidechain_id,
