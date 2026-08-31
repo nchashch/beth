@@ -1585,6 +1585,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
+ "clap",
  "eyre",
  "hex",
  "miette",
@@ -1593,6 +1594,7 @@ dependencies = [
  "protox",
  "reth-basic-payload-builder",
  "reth-chainspec",
+ "reth-cli",
  "reth-consensus",
  "reth-ethereum",
  "reth-ethereum-cli",

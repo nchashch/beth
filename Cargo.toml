@@ -11,6 +11,7 @@ tonic-prost-build = "0.14.2"
 
 [dependencies]
 miette = "7.6.0"
+clap = "4.6.6"
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", features = ["full"] }
 tokio = { version = "1.53.1", features = ["full"] }
 
@@ -23,6 +24,7 @@ reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }

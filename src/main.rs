@@ -1,8 +1,11 @@
+mod chainspec;
 mod consensus;
 mod enforcer;
 mod payload;
 mod proto;
 
+use chainspec::BethChainSpecParser;
+use clap::Parser;
 use consensus::Bip300301ConsensusBuilder;
 use enforcer::EnforcerClient;
 use payload::Bip300301PayloadBuilderBuilder;
@@ -11,7 +14,7 @@ use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
 
 fn main() -> eyre::Result<()> {
-    Cli::parse_args().run(async move |builder, _| {
+    Cli::<BethChainSpecParser>::parse().run(async move |builder, _| {
         // TODO: make configurable (CLI flag / env var) instead of hardcoding.
         let enforcer_url = std::env::var("BIP300301_ENFORCER_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".into());
