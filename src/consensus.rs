@@ -24,13 +24,13 @@ use crate::enforcer::EnforcerClient;
 /// BIP301 blind-merge-mining committed in the Bitcoin mainchain block referenced by its
 /// `extraData` field (see [`crate::payload`] for how that field is populated).
 #[derive(Debug, Clone)]
-pub struct Bip301Consensus<ChainSpec> {
+pub struct Bip300301Consensus<ChainSpec> {
     inner: EthBeaconConsensus<ChainSpec>,
     enforcer: EnforcerClient,
     sidechain_id: u32,
 }
 
-impl<ChainSpec: EthChainSpec + EthereumHardforks> Bip301Consensus<ChainSpec> {
+impl<ChainSpec: EthChainSpec + EthereumHardforks> Bip300301Consensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>, enforcer: EnforcerClient, sidechain_id: u32) -> Self {
         Self {
             inner: EthBeaconConsensus::new(chain_spec),
@@ -40,7 +40,7 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> Bip301Consensus<ChainSpec> {
     }
 }
 
-impl<H, ChainSpec> HeaderValidator<H> for Bip301Consensus<ChainSpec>
+impl<H, ChainSpec> HeaderValidator<H> for Bip300301Consensus<ChainSpec>
 where
     H: BlockHeader,
     ChainSpec: EthChainSpec<Header = H> + EthereumHardforks + Debug + Send + Sync,
@@ -84,7 +84,7 @@ where
     }
 }
 
-impl<B, ChainSpec> Consensus<B> for Bip301Consensus<ChainSpec>
+impl<B, ChainSpec> Consensus<B> for Bip300301Consensus<ChainSpec>
 where
     B: Block,
     ChainSpec: EthChainSpec<Header = B::Header> + EthereumHardforks + Debug + Send + Sync,
@@ -106,7 +106,7 @@ where
     }
 }
 
-impl<N, ChainSpec> FullConsensus<N> for Bip301Consensus<ChainSpec>
+impl<N, ChainSpec> FullConsensus<N> for Bip300301Consensus<ChainSpec>
 where
     N: NodePrimitives,
     ChainSpec: Send + Sync + EthChainSpec<Header = N::BlockHeader> + EthereumHardforks + Debug,
@@ -128,14 +128,14 @@ where
     }
 }
 
-/// Builder that wires [`Bip301Consensus`] in as the node's consensus component.
+/// Builder that wires [`Bip300301Consensus`] in as the node's consensus component.
 #[derive(Debug, Clone)]
-pub struct Bip301ConsensusBuilder {
+pub struct Bip300301ConsensusBuilder {
     enforcer: EnforcerClient,
     sidechain_id: u32,
 }
 
-impl Bip301ConsensusBuilder {
+impl Bip300301ConsensusBuilder {
     pub fn new(enforcer: EnforcerClient, sidechain_id: u32) -> Self {
         Self {
             enforcer,
@@ -144,16 +144,16 @@ impl Bip301ConsensusBuilder {
     }
 }
 
-impl<Node> ConsensusBuilder<Node> for Bip301ConsensusBuilder
+impl<Node> ConsensusBuilder<Node> for Bip300301ConsensusBuilder
 where
     Node: FullNodeTypes<
         Types: NodeTypes<ChainSpec: EthChainSpec + EthereumHardforks, Primitives = EthPrimitives>,
     >,
 {
-    type Consensus = Arc<Bip301Consensus<<Node::Types as NodeTypes>::ChainSpec>>;
+    type Consensus = Arc<Bip300301Consensus<<Node::Types as NodeTypes>::ChainSpec>>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        Ok(Arc::new(Bip301Consensus::new(
+        Ok(Arc::new(Bip300301Consensus::new(
             ctx.chain_spec(),
             self.enforcer,
             self.sidechain_id,

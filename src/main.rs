@@ -3,9 +3,9 @@ mod enforcer;
 mod payload;
 mod proto;
 
-use consensus::Bip301ConsensusBuilder;
+use consensus::Bip300301ConsensusBuilder;
 use enforcer::EnforcerClient;
-use payload::Bip301PayloadBuilderBuilder;
+use payload::Bip300301PayloadBuilderBuilder;
 use reth_ethereum_cli::interface::Cli;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
@@ -13,13 +13,13 @@ use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
 fn main() -> eyre::Result<()> {
     Cli::parse_args().run(async move |builder, _| {
         // TODO: make configurable (CLI flag / env var) instead of hardcoding.
-        let enforcer_url =
-            std::env::var("BIP301_ENFORCER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+        let enforcer_url = std::env::var("BIP300301_ENFORCER_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".into());
         let enforcer = EnforcerClient::new(enforcer_url);
 
         // TODO: make configurable (CLI flag / env var) instead of hardcoding. This is the
         // sidechain slot number beth registers as with the enforcer.
-        let sidechain_id: u32 = std::env::var("BIP301_SIDECHAIN_ID")
+        let sidechain_id: u32 = std::env::var("BETH_SIDECHAIN_ID")
             .ok()
             .map(|s| s.parse())
             .transpose()?
@@ -29,9 +29,12 @@ fn main() -> eyre::Result<()> {
             .with_types::<EthereumNode>()
             .with_components(
                 EthereumNode::components()
-                    .consensus(Bip301ConsensusBuilder::new(enforcer.clone(), sidechain_id))
+                    .consensus(Bip300301ConsensusBuilder::new(
+                        enforcer.clone(),
+                        sidechain_id,
+                    ))
                     .payload(BasicPayloadServiceBuilder::new(
-                        Bip301PayloadBuilderBuilder::new(enforcer),
+                        Bip300301PayloadBuilderBuilder::new(enforcer, sidechain_id),
                     )),
             )
             .with_add_ons(EthereumAddOns::default())
