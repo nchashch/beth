@@ -1,20 +1,21 @@
-//! Wraps reth's stock Ethereum [`ConfigureEvm`] to additionally run a BIP300 withdrawal-bundle
-//! "system call" against `WithdrawalRequestQueue` once per block — the same mechanism
-//! EIP-4788/2935/7002 use to write protocol-level state with no transaction and no signature
-//! (see `evm.transact_system_call` below). See `crate::withdrawal_bundle`'s module doc comment
-//! for the full picture; this file is just the reth-integration plumbing that calls
-//! [`withdrawal_bundle::compute_lifecycle_update`] at the right point in block
-//! building/validation and applies its result.
+//! Wraps reth's stock Ethereum [`ConfigureEvm`] to additionally run two BIP300/301 "system
+//! calls" once per block — the same mechanism EIP-4788/2935/7002 use to write protocol-level
+//! state with no transaction and no signature (see `evm.transact_system_call` below):
+//! - [`deposit_vault::deposits_calldata`] against `DepositVault`, crediting BIP300 deposits
+//!   (Bitcoin mainchain -> this sidechain). See [`crate::deposit_vault`]'s module doc comment.
+//! - [`withdrawal_bundle::compute_lifecycle_update`] against `WithdrawalRequestQueue`, advancing
+//!   the BIP300 withdrawal-bundle lifecycle (this sidechain -> Bitcoin mainchain). See
+//!   [`crate::withdrawal_bundle`]'s module doc comment.
 //!
 //! This hooks into [`BlockExecutor::apply_pre_execution_changes`], which runs once per block —
 //! for a block being *built* (via [`ConfigureEvm::context_for_next_block`]) and, identically,
 //! for a block being *validated* (via [`ConfigureEvm::context_for_block`], which every node
-//! runs on every block, self-produced or received, before accepting it). Because
-//! `compute_lifecycle_update` is a pure function of already-agreed inputs (this contract's own
-//! prior state, plus the enforcer's report of mainchain events for this block's own committed
-//! range), every node computes the identical system call independently — so if a block's
-//! declared `stateRoot` doesn't match what a validator computes, standard state-root validation
-//! (already inherited via `EthBeaconConsensus`) rejects it. No separate consensus check needed.
+//! runs on every block, self-produced or received, before accepting it). Because both calls are
+//! pure functions of already-agreed inputs (each contract's own prior state, plus the enforcer's
+//! report of mainchain events for this block's own committed range), every node computes the
+//! identical system calls independently — so if a block's declared `stateRoot` doesn't match
+//! what a validator computes, standard state-root validation (already inherited via
+//! `EthBeaconConsensus`) rejects it. No separate consensus check needed for either.
 
 use std::fmt::Debug;
 
@@ -43,7 +44,7 @@ use revm::{
     DatabaseCommit, Inspector, context::Block as RevmBlockEnv, primitives::hardfork::SpecId,
 };
 
-use crate::{enforcer::EnforcerClient, withdrawal_bundle};
+use crate::{deposit_vault, enforcer::EnforcerClient, withdrawal_bundle};
 
 /// Wraps [`EthEvmConfig`], swapping in [`Bip300301BlockExecutorFactory`] as the executor
 /// factory. Every other [`ConfigureEvm`] method delegates straight to the inner config.
@@ -302,6 +303,23 @@ where
         let parent_main_hash = B256::try_from(parent_header.extra_data().as_ref()).ok();
         let main_hash = B256::try_from(self.extra_data.as_ref())
             .map_err(|_| BlockExecutionError::msg("block extraData must be exactly 32 bytes"))?;
+
+        let deposits = self
+            .enforcer
+            .deposits(self.sidechain_id, parent_main_hash, main_hash)
+            .map_err(BlockExecutionError::other)?;
+        if let Some(calldata) = deposit_vault::deposits_calldata(&deposits) {
+            let result = self
+                .inner
+                .evm_mut()
+                .transact_system_call(
+                    SYSTEM_ADDRESS,
+                    deposit_vault::DEPOSIT_VAULT_ADDRESS,
+                    calldata.into(),
+                )
+                .map_err(|err| BlockExecutionError::msg(err.to_string()))?;
+            self.inner.evm_mut().db_mut().commit(result.state);
+        }
 
         let state = self
             .provider

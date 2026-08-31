@@ -1,5 +1,6 @@
 mod chainspec;
 mod consensus;
+mod deposit_vault;
 mod enforcer;
 mod evm;
 mod payload;
