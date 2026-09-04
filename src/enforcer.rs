@@ -73,12 +73,30 @@ impl EnforcerClient {
         })
     }
 
-    /// Returns whether `sidechain_block_hash` is the BIP301 BMM h* commitment recorded in
-    /// `main_block_hash`, for sidechain `sidechain_id`.
+    /// How many recent mainchain blocks (the current tip, plus this many ancestors) to search
+    /// for a sidechain's BMM commitment. See [`Self::is_committed`]'s doc comment for why the
+    /// search starts at the tip rather than at the block the header actually references.
+    const BMM_COMMITMENT_SEARCH_ANCESTORS: u32 = 16;
+
+    /// Returns whether `sidechain_block_hash` is the BIP301 BMM h* commitment recorded in the
+    /// current mainchain tip or one of its last [`Self::BMM_COMMITMENT_SEARCH_ANCESTORS`]
+    /// ancestors, for sidechain `sidechain_id`.
     ///
-    /// Note: this only checks the specific mainchain block referenced by the header being
-    /// validated. It does not walk mainchain ancestry to tolerate the commitment landing in a
-    /// later block (as e.g. `thunder-rust`'s `archive.rs` does for reorg/latency tolerance).
+    /// `main_block_hash` (from the header's `extraData`) is the mainchain tip the block was
+    /// built on top of when its BMM bid was submitted -- but the enforcer embeds a sidechain's
+    /// BMM commitment (M7) into the *next* mainchain block mined after a bid is submitted
+    /// against a given tip, never into that tip itself (confirmed empirically: a bid submitted
+    /// with `prevBytes = X` always gets its commitment recorded in `X`'s child, once mined --
+    /// never in `X`). So a commitment made against `main_block_hash` always lands in one of
+    /// `main_block_hash`'s mainchain *successors*, and checking only `main_block_hash` itself,
+    /// as this function previously did, could never succeed for any block, mined any way.
+    ///
+    /// Mirrors `thunder-rust`'s `Archive::put_header` / `put_main_block_info`, which look up
+    /// `get_main_successors(header.prev_main_hash)` for exactly this reason. Ported here as a
+    /// backward search from the *current* tip instead, since the enforcer's
+    /// `GetBmmHStarCommitment` RPC only supports walking backward (`max_ancestors`) from a
+    /// given block -- covering the same ground as long as the tip hasn't advanced more than
+    /// `BMM_COMMITMENT_SEARCH_ANCESTORS` blocks past `main_block_hash` since the bid landed.
     pub fn is_committed(
         &self,
         sidechain_block_hash: B256,
@@ -86,12 +104,28 @@ impl EnforcerClient {
         sidechain_id: u32,
     ) -> Result<bool, EnforcerError> {
         self.handle.block_on(async {
+            tracing::trace!(
+                %sidechain_block_hash,
+                %main_block_hash,
+                "checking BMM commitment against the current tip and recent ancestors",
+            );
+            let tip_response = self
+                .client()
+                .get_chain_tip(GetChainTipRequest {})
+                .await?
+                .into_inner();
+            let tip_hex = tip_response
+                .block_header_info
+                .ok_or(EnforcerError::MissingField("block_header_info"))?
+                .block_hash
+                .ok_or(EnforcerError::MissingField("block_hash"))?
+                .hex
+                .ok_or(EnforcerError::MissingField("hex"))?;
+
             let request = GetBmmHStarCommitmentRequest {
-                block_hash: Some(ReverseHex {
-                    hex: Some(hex::encode(main_block_hash)),
-                }),
+                block_hash: Some(ReverseHex { hex: Some(tip_hex) }),
                 sidechain_id: Some(sidechain_id),
-                max_ancestors: None,
+                max_ancestors: Some(Self::BMM_COMMITMENT_SEARCH_ANCESTORS),
             };
             let response = self
                 .client()
@@ -105,14 +139,21 @@ impl EnforcerClient {
                 // Covers both "block not found" and "no commitment for this sidechain yet".
                 return Ok(false);
             };
-            let Some(commitment) = commitment.commitment else {
-                return Ok(false);
-            };
-            let Some(hex) = commitment.hex else {
-                return Ok(false);
-            };
-
-            Ok(parse_hex32(&hex)? == sidechain_block_hash)
+            let commitments = std::iter::once(commitment.commitment).chain(
+                commitment
+                    .ancestor_commitments
+                    .into_iter()
+                    .map(|ancestor| ancestor.commitment),
+            );
+            for commitment in commitments.flatten() {
+                let Some(hex) = commitment.hex else {
+                    continue;
+                };
+                if parse_hex32(&hex)? == sidechain_block_hash {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         })
     }
 

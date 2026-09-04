@@ -9,7 +9,14 @@ use reth_ethereum_cli::chainspec::chain_value_parser;
 
 /// beth's genesis, embedded at compile time. Predeploys [`WithdrawalRequestQueue`] (see
 /// `contracts/WithdrawalRequestQueue.sol`) at `0x000000000000000000000000000000000000B300`, and
-/// activates every hardfork through Osaka from timestamp 0.
+/// activates every hardfork through Prague from timestamp 0.
+///
+/// Deliberately stops at Prague rather than also activating Osaka: this reth build's Osaka
+/// support (`engine_newPayloadV5`) requires a `blockAccessList` on every submitted payload, but
+/// validates it against the separate, experimental "Amsterdam" fork -- which this chain doesn't
+/// (and, being unreleased/unstable, shouldn't) activate -- rejecting any value for that field
+/// unconditionally. That combination makes Osaka activation unusable for payload submission on
+/// this reth version; Prague is already sufficient for standard contract testing.
 ///
 /// [`WithdrawalRequestQueue`]: https://github.com/LayerTwo-Labs/beth/blob/main/contracts/WithdrawalRequestQueue.sol
 const BETH_GENESIS_JSON: &str = include_str!("../genesis.json");
