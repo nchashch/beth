@@ -30,7 +30,7 @@ fn main() -> eyre::Result<()> {
             .ok()
             .map(|s| s.parse())
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or(10);
 
         let handle = builder
             .with_types::<EthereumNode>()
