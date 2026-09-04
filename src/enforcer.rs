@@ -2,7 +2,7 @@
 //! enforcer's own `.proto` definitions (see `build.rs` and `crate::proto`) — the same approach
 //! `thunder-rust` uses.
 
-use std::fmt;
+use std::{fmt, str::FromStr as _};
 
 use alloy_primitives::{Address, B256};
 use bitcoin::hashes::Hash as _;
@@ -161,8 +161,12 @@ impl EnforcerClient {
     /// `start_block_hash` (exclusive) up to and including `end_block_hash`.
     /// `start_block_hash = None` returns deposits from the start of BIP300 history.
     ///
-    /// Assumes each deposit's destination `address` is the raw 20 bytes of an L2 `Address`, as
-    /// chosen by the depositor — the enforcer treats it as opaque sidechain-defined data.
+    /// A deposit's destination `address` is, from the enforcer's perspective, an arbitrary
+    /// string chosen by the depositor -- it's opaque, sidechain-defined data (the enforcer
+    /// pushes its raw UTF-8 bytes on-chain and hands them back exactly as given, whatever they
+    /// mean). This sidechain defines that string to be the standard `0x`-prefixed hex
+    /// representation of an L2 `Address`, the same format every other Ethereum tool uses -- see
+    /// [`parse_deposit_address`].
     pub fn deposits(
         &self,
         sidechain_id: u32,
@@ -208,7 +212,7 @@ impl EnforcerClient {
                         .and_then(|address| address.hex)
                         .ok_or(EnforcerError::MissingField("address"))?;
                     deposits.push(Deposit {
-                        address: parse_address(&address_hex)?,
+                        address: parse_deposit_address(&address_hex)?,
                         value_sats,
                     });
                 }
@@ -340,10 +344,21 @@ fn parse_hex32(hex_str: &str) -> Result<B256, EnforcerError> {
     B256::try_from(bytes.as_slice()).map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))
 }
 
-fn parse_address(hex_str: &str) -> Result<Address, EnforcerError> {
-    let bytes = hex::decode(strip_0x(hex_str))
-        .map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))?;
-    Address::try_from(bytes.as_slice()).map_err(|_| EnforcerError::InvalidHex(hex_str.to_owned()))
+/// Parses a deposit's destination address off the wire. The wire value (`hex_str`) is the
+/// enforcer's hex encoding of the raw bytes it stored on-chain -- which are the UTF-8 bytes of
+/// whatever string the depositor originally gave `CreateDepositTransactionRequest.address` (see
+/// `deposits`'s doc comment: the enforcer treats that string as opaque, sidechain-owned data).
+/// So this decodes in two steps: hex-decode the wire value to recover that original string, then
+/// parse the string as a standard `0x`-prefixed Ethereum address via [`Address::from_str`] --
+/// the same parser (prefix handling, EIP-55 checksum validation) any other Ethereum tooling
+/// uses, so a depositor can just paste their address's normal string form.
+fn parse_deposit_address(hex_str: &str) -> Result<Address, EnforcerError> {
+    let raw_bytes = hex::decode(strip_0x(hex_str))
+        .map_err(|_| EnforcerError::InvalidDepositAddress(hex_str.to_owned()))?;
+    let address_str = std::str::from_utf8(&raw_bytes)
+        .map_err(|_| EnforcerError::InvalidDepositAddress(hex_str.to_owned()))?;
+    Address::from_str(address_str)
+        .map_err(|_| EnforcerError::InvalidDepositAddress(address_str.to_owned()))
 }
 
 /// Parses a `ConsensusHex`-encoded txid — i.e. raw/internal byte order, as used by
@@ -368,4 +383,6 @@ pub enum EnforcerError {
     MissingField(&'static str),
     #[error("enforcer returned invalid hex: {0}")]
     InvalidHex(String),
+    #[error("deposit destination is not a valid Ethereum address: {0}")]
+    InvalidDepositAddress(String),
 }
