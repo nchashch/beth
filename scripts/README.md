@@ -8,18 +8,24 @@ beth's EVM compatibility end to end.
 ## 1. Workspace layout
 
 These scripts expect to live two directories below a common workspace root, alongside sibling
-checkouts of every other component:
+checkouts of `bitcoin-patched` and `electrs`:
 
 ```
 <workspace root>/
 ├── bitcoin-patched/        # LayerTwo-Labs' drivechain fork of Bitcoin Core
-├── bip300301_enforcer/     # BIP300/301 enforcer node
 ├── electrs/                # Electrum server (indexes bitcoind for the enforcer's wallet)
 ├── beth/                   # this repo
+│   ├── bip300301_enforcer/ # BIP300/301 enforcer node -- a git submodule of beth, not a
+│   │                       # sibling checkout (see beth/.gitmodules, beth/build.rs)
 │   └── scripts/            # <- you are here
 ├── DATADIR/                # generated: all per-process data/logs live here
 └── contracts-test/         # generated: scaffolded by test-contracts.sh
 ```
+
+`bip300301_enforcer` lives *inside* `beth/` rather than alongside it because `beth`'s own build
+compiles that repo's protobuf definitions directly (see `beth/build.rs`) -- a git submodule pins
+it to a specific, reviewed commit, the same way `thunder-rust` (a reference BIP300/301 sidechain)
+vendors it, rather than leaving "whatever's cloned as a sibling" as a moving target.
 
 `ROOT` (the workspace root) is computed by each script as two directories up from itself, so if
 you move `scripts/` anywhere else relative to the other checkouts, update that computation
@@ -28,7 +34,8 @@ accordingly, or export the individual `*_CLI`/`*_DATADIR` overrides each script 
 (see each script's own header comment).
 
 `DATADIR/` and `contracts-test/` are created for you the first time you run the scripts below --
-nothing needs to exist ahead of time except the four repo checkouts.
+nothing needs to exist ahead of time except `bitcoin-patched`, `electrs`, and `beth` itself (with
+its `bip300301_enforcer` submodule fetched).
 
 ## 2. Prerequisites
 
@@ -44,20 +51,22 @@ nothing needs to exist ahead of time except the four repo checkouts.
   Safe to re-run; installs `foundryup` if missing, then always runs it to install/update
   `forge`/`cast`/`anvil`/`chisel`.
 
-## 3. Clone and build the sibling repos
+## 3. Fetch and build everything
 
 ```bash
+git submodule update --init      # fetches beth/bip300301_enforcer, needed for beth's own build
 scripts/setup-workspace.sh
 ```
 
-Clones `bitcoin-patched`, `bip300301_enforcer`, and `electrs` into the workspace root (skipping
-any that are already checked out, leaving them untouched), builds all three with the right
-config (in particular `-DWITH_ZMQ=ON` for `bitcoin-patched` -- see below), and creates an empty
-`DATADIR/`. Safe to re-run; every build is incremental via cargo's/cmake's own caching. Doesn't
-build `beth` itself (you're already in it) or install Foundry -- do those two separately:
+`setup-workspace.sh` clones `bitcoin-patched` and `electrs` into the workspace root (skipping
+either that's already checked out, leaving it untouched), builds those two plus the
+`bip300301_enforcer` submodule with the right config (in particular `-DWITH_ZMQ=ON` for
+`bitcoin-patched` -- see below), and creates an empty `DATADIR/`. Safe to re-run; every build is
+incremental via cargo's/cmake's own caching. Doesn't build `beth` itself (you're already in it)
+or install Foundry -- do those two separately:
 
 ```bash
-(cd beth && cargo build --release)
+(cd beth && cargo build --release)   # needs the submodule fetched above
 scripts/install-foundry.sh
 ```
 
@@ -65,9 +74,9 @@ Equivalent by hand, if you'd rather clone/build individually or need to customiz
 exactly what `scripts/setup-workspace.sh` automates):
 
 ```bash
-# From the workspace root:
-git clone git@github.com:LayerTwo-Labs/bitcoin-patched.git
-git clone git@github.com:LayerTwo-Labs/bip300301_enforcer.git
+# From the workspace root (add a `git@github.com:...` remote yourself afterwards if you need
+# push access -- these clone over HTTPS since both repos are public):
+git clone https://github.com/LayerTwo-Labs/bitcoin-patched.git
 git clone https://github.com/mempool/electrs      # 'mempool' branch, used here
 
 # bitcoin-patched -- CMake-based (branches off Bitcoin Core v29.2 + drivechain patches).
@@ -78,12 +87,14 @@ git clone https://github.com/mempool/electrs      # 'mempool' branch, used here
 cmake -B bitcoin-patched/build -S bitcoin-patched -DWITH_ZMQ=ON
 cmake --build bitcoin-patched/build -j"$(nproc)"
 
-# bip300301_enforcer
-(cd bip300301_enforcer && cargo build --release)
-
 # electrs (mempool/electrs fork, "mempool" branch -- already the default on clone;
 # --bin electrs since the crate builds more than one binary)
 (cd electrs && cargo build --release --bin electrs)
+
+# bip300301_enforcer -- from beth's own submodule (`git submodule update --init` inside beth/
+# first, if you haven't already), not a separate clone, so it always matches the proto
+# definitions beth itself was built against.
+(cd beth/bip300301_enforcer && cargo build --release)
 ```
 
 A debug build (plain `cargo build`, no `--release`) works too -- `regtest-up.sh` prefers a
@@ -207,6 +218,6 @@ scripts/test-contracts.sh 10
   validator then rejects, every time, forever. Symptom: `bmm-mine.sh` iterations start failing
   with `deadline_exceeded: ... the enforcer has fallen behind Bitcoin Core, or rejected the
   block`, and the mainchain tip stops advancing even though `bmm-mine.sh` is still running. This
-  is a bug in `bip300301_enforcer` itself (see `lib/block_producer/mine.rs` and
-  `lib/validator/cusf_enforcer.rs`), not in these scripts or in `beth` -- the only known fix
-  right now is `scripts/regtest-reset.sh` and starting over.
+  is a bug in `bip300301_enforcer` itself (see `beth/bip300301_enforcer/lib/block_producer/mine.rs`
+  and `beth/bip300301_enforcer/lib/validator/cusf_enforcer.rs`), not in these scripts or in
+  `beth` -- the only known fix right now is `scripts/regtest-reset.sh` and starting over.

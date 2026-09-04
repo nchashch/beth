@@ -46,7 +46,7 @@ done
 RUNNING_PIDS=()
 while IFS= read -r pid; do
     [ -n "$pid" ] && RUNNING_PIDS+=("$pid")
-done < <(pgrep -f "$ROOT/(bitcoin-patched/build/bin/bitcoind|electrs/target/(release|debug)/electrs|bip300301_enforcer/target/(release|debug)/bip300301_enforcer|beth/target/(release|debug)/beth) " 2>/dev/null || true)
+done < <(pgrep -f "$ROOT/(bitcoin-patched/build/bin/bitcoind|electrs/target/(release|debug)/electrs|beth/bip300301_enforcer/target/(release|debug)/bip300301_enforcer|beth/target/(release|debug)/beth) " 2>/dev/null || true)
 
 if [ "${#RUNNING_PIDS[@]}" -gt 0 ]; then
     if [ "$FORCE" -ne 1 ]; then

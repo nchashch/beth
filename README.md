@@ -53,9 +53,13 @@ needs a running enforcer (and, behind that, a regtest/real Bitcoin node) to talk
 - `src/deposit_vault.rs` / `src/withdrawal_bundle.rs` -- the Rust-side logic for each system call
   (reading pending withdrawals and selecting a bundle; building the deposit-credit calldata).
 - `src/enforcer.rs` / `src/proto.rs` -- the gRPC client for the enforcer's `ValidatorService`,
-  generated from its own `.proto` definitions (see `build.rs`) -- the same approach
-  [`thunder-rust`](https://github.com/LayerTwo-Labs/thunder-rust), a reference UTXO-based
-  BIP300/301 sidechain, uses.
+  generated from its own `.proto` definitions (see `build.rs`).
+- `bip300301_enforcer/` -- a git submodule vendoring
+  [`bip300301_enforcer`](https://github.com/LayerTwo-Labs/bip300301_enforcer) itself, pinned to a
+  specific, reviewed commit -- `build.rs` compiles its `.proto` definitions directly from here.
+  The same approach [`thunder-rust`](https://github.com/LayerTwo-Labs/thunder-rust) (a reference
+  UTXO-based BIP300/301 sidechain) uses. Not initialized by a plain `git clone` -- see "Building"
+  below.
 - `src/chainspec.rs` -- `beth`'s own genesis (`genesis.json`, chain ID `300301`), embedded at
   compile time and used by default. Currently activates hardforks through Prague only,
   deliberately -- see the doc comment there for why (a real, confirmed limitation in this pinned
@@ -63,15 +67,28 @@ needs a running enforcer (and, behind that, a regtest/real Bitcoin node) to talk
 
 ## Building
 
+`beth`'s build compiles [`bip300301_enforcer`](https://github.com/LayerTwo-Labs/bip300301_enforcer)'s
+own protobuf definitions directly (see `build.rs`), from the `bip300301_enforcer/` git submodule
+vendored in this repo (see `.gitmodules`) -- not a sibling checkout, and not optional: the
+submodule needs to be checked out *before* `cargo build` will succeed.
+
 ```bash
+git clone --recurse-submodules <this repo's URL>
+# ...or, if you already have a plain (non-recursive) clone:
+git submodule update --init
+
 cargo build --release
 ```
 
+Needs a reasonably recent Rust toolchain (`rust-version = "1.95"`, edition 2024, in `Cargo.toml`).
+
 ## Running it against a local regtest devnet
 
-`beth` needs a `bip300301_enforcer` (and, behind that, a patched, BIP300/301-aware Bitcoin node)
-to talk to before it does anything useful. **See [`scripts/`](scripts/) and in particular
-[`scripts/README.md`](scripts/README.md)** for everything needed to build that companion
-infrastructure, bring up a full local regtest devnet, and drive it end to end -- block
-production, deposits, withdrawals, and testing `beth` against a real, unmodified Foundry
-workflow.
+`beth` needs a running `bip300301_enforcer` (and, behind that, a patched, BIP300/301-aware
+Bitcoin node) to talk to before it does anything useful -- it won't do much of interest run on
+its own. **See [`scripts/`](scripts/) and in particular [`scripts/README.md`](scripts/README.md)**
+for everything needed to bring up that companion infrastructure (including building
+`bip300301_enforcer`'s actual binary *from the same submodule* `beth` compiled its proto
+definitions from, so the two can never drift apart), run a full local regtest devnet, and drive
+it end to end -- block production, deposits, withdrawals, and testing `beth` against a real,
+unmodified Foundry workflow.

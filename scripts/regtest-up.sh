@@ -79,10 +79,15 @@ BITCOIN_CLI="$ROOT/bitcoin-patched/build/bin/bitcoin-cli"
 [ -x "$BITCOIND" ] || { echo "error: bitcoind not found at $BITCOIND (build bitcoin-patched/ first)" >&2; exit 1; }
 [ -x "$BITCOIN_CLI" ] || { echo "error: bitcoin-cli not found at $BITCOIN_CLI" >&2; exit 1; }
 
+# bip300301_enforcer is a git submodule of beth itself (see beth/.gitmodules, beth/build.rs),
+# not a sibling checkout -- pinned to a specific, reviewed commit, the same way thunder-rust
+# vendors it.
 ENFORCER="$(pick_bin bip300301_enforcer \
-    "$ROOT/bip300301_enforcer/target/release/bip300301_enforcer" \
-    "$ROOT/bip300301_enforcer/target/debug/bip300301_enforcer")" \
-    || { echo "  build with: (cd bip300301_enforcer && cargo build --release)" >&2; exit 1; }
+    "$ROOT/beth/bip300301_enforcer/target/release/bip300301_enforcer" \
+    "$ROOT/beth/bip300301_enforcer/target/debug/bip300301_enforcer")" \
+    || { echo "  build with: (cd beth/bip300301_enforcer && cargo build --release), after" >&2
+         echo "  'git submodule update --init' inside beth/ if that directory is empty" >&2
+         exit 1; }
 
 ELECTRS="$(pick_bin electrs \
     "$ROOT/electrs/target/release/electrs" \
