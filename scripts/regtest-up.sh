@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Brings up the local BIP300/301 regtest stack: bitcoind -> bip300301_enforcer -> electrs,
+# Brings up the local BIP300/301 regtest stack: bitcoind -> electrs -> bip300301_enforcer,
 # with beth (the reth-based sidechain) wired to the enforcer.
 #
 #   bitcoind (regtest, cookie auth)
